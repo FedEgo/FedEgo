@@ -26,10 +26,11 @@ class LowLayer(nn.Module):
 
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, sageMode, in_feats, out_feats, h_feats, layer_size=2):
+    def __init__(self, sageMode, in_feats, out_feats, h_feats, linear, layer_size=2):
         super(GNNLayer, self).__init__()
         self.layer_size = layer_size
         self.sageMode = sageMode
+        self.linear = linear
         if self.sageMode == "GraphSAGE":
             self.sage1 = SAGEConv(in_feats, h_feats)
             self.sage2 = SAGEConv(h_feats, out_feats)
@@ -49,8 +50,12 @@ class GNNLayer(torch.nn.Module):
 
     def forward(self, x, edge_index):
         x = self.sage1(x, edge_index)
+        if not self.linear:
+            x = F.relu(x)
         for layer in range(self.layer_size - 2):
             x = self.sagex[layer](x, edge_index)
+            if not self.linear:
+                x = F.relu(x)
         x = self.sage2(x, edge_index)
         x = F.relu(x)
         return x
@@ -86,6 +91,7 @@ class FedGCN(torch.nn.Module):
 
     def forward(self, x, adj):
         x = self.linear1(x)
+        x = adj.mm(x)
         x = F.relu(x)
         x = F.dropout(x, p=0.5)
         x = adj.mm(x)
@@ -93,4 +99,3 @@ class FedGCN(torch.nn.Module):
         x = F.relu(x)
         x = F.softmax(x, dim=1)
         return x
-

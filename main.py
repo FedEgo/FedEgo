@@ -4,7 +4,6 @@ import pyhocon
 import random
 
 from torch_geometric import datasets
-
 from dataCenter import *
 from utils import *
 from models import *
@@ -23,7 +22,7 @@ if torch.cuda.is_available():
         print("using device", device_id, torch.cuda.get_device_name(device_id))
 
 # device = torch.device("cuda" if args.cuda else "cpu")
-device = "cuda:1"
+device = "cuda:0"
 print("DEVICE:", device, flush=True)
 
 if __name__ == "__main__":
@@ -39,6 +38,8 @@ if __name__ == "__main__":
     config = pyhocon.ConfigFactory.parse_file(args.config)
 
     args.learning_rate = 3e-4
+    lamb_fixed = args.lamb_fixed
+
     if args.dataSet in ["cora", "citeseer"]:
         args.client_num = 5
         args.sample_rate = 0.5
@@ -48,19 +49,22 @@ if __name__ == "__main__":
         args.h_feats = 512
         args.epochs = 200
         if args.dataSet == "citeseer":
-            lamb_map = {1027: 0.125, 1107: 0.25, 2333: 0.125, 9973: 0.125}
+            # pass
+            lamb_map = {1027: 0.125, 1107: 0.375, 2333: 0.75, 9973: 0.25}
             args.lamb_c = lamb_map[args.seed]
         if args.dataSet == "cora":
-            lamb_map = {1027: 0.25, 1107: 0.25, 2333: 0.375, 9973: 0.875}
+            lamb_map = {1027: 0.125, 1107: 0.125, 2333: 0.125, 9973: 0.25}
             args.lamb_c = lamb_map[args.seed]
     elif args.dataSet in ["wiki"]:
         args.client_num = 10
         args.sample_rate = 0.2
         args.global_sample_rate = 0.3
         args.h_feats = 512
-        # if args.mode in ["fedgcn"]:
+        if args.mode in ["fedego"]:
+            args.epochs = 300
+            args.lr = 5e-4
         #     args.learning_rate = 0.01
-        lamb_map = {1027: 0.25, 1107: 0.375, 2333: 0.125, 9973: 0.75}
+        lamb_map = {1027: 0.75, 1107: 0.5, 2333: 0.75, 9973: 0.75}
         args.lamb_c = lamb_map[args.seed]
     elif args.dataSet in ["corafull"]:
         args.client_num = 10
@@ -68,17 +72,15 @@ if __name__ == "__main__":
         args.sample_rate = 0.3
         args.global_sample_rate = 0.3
         args.h_feats = 512
-        lamb_map = {1027: 0.125, 1107: 0.125, 2333: 0.125, 9973: 0.125}
+        if args.mode in ["fedego"]:
+            args.lr = 5e-4
+        lamb_map = {1027: 0.25, 1107: 0.125, 2333: 0.125, 9973: 0.25}
         args.lamb_c = lamb_map[args.seed]
 
     client_train_epoch = args.client_train_epoch
     server_train_epoch = args.server_train_epoch
     client_num = args.client_num
     lamb_c = args.lamb_c
-    if args.lamb_fixed == 1:
-        lamb_fixed = True
-    else:
-        lamb_fixed = False
     major_rate = args.major_rate
     mode = args.mode
     lr = args.lr
@@ -92,13 +94,13 @@ if __name__ == "__main__":
     timing = args.timing
     early_stopping = args.early_stopping
     early_stopping_bound = 1.3
+    cal_cost = args.cal_cost
+    linear = args.linear
 
     logUrl = "./log/" + args.dataSet + "_" + mode
     image_url = "./images/" + args.dataSet + "/" + mode
-
     logUrl += args.logsuffix + "_seed_" + \
         str(args.seed)+"_lambc_"+str(args.lamb_c)
-
     image_url += args.logsuffix+"_seed_" + \
         str(args.seed)+"_lambc_"+str(args.lamb_c)+".png"
 
@@ -108,7 +110,7 @@ if __name__ == "__main__":
     print("lamb_c: ", lamb_c)
     print("log addr: ", logUrl)
     print("image addr: ", image_url)
-    print("learning rate: ", args.learning_rate)
+    print("learning rate: ", args.lr)
     print("batch size: ", batch_size)
 
     writer = SummaryWriter(logUrl)
@@ -128,15 +130,15 @@ if __name__ == "__main__":
     # init clients
     clients = [
         Client(data[i], mode, sageMode, in_feats, h_feats, num_classes, test_num, lr, dropout,
-               device, mixup).to(device) for i in range(client_num)
+               device, mixup, linear).to(device) for i in range(client_num)
     ]
 
     print("clients init finished ", flush=True)
 
     # init server
-    if mode in ["fedego", "fedego_nr"]:
+    if mode in ["fedego", "fedego_nr", "fedego_ne"]:
         server = Server(mode, sageMode, h_feats,
-                        num_classes, lr, dropout, device)
+                        num_classes, lr, dropout, device, linear)
         server_max_vali_f1 = 0
 
     local_f1 = [0 for i in range(client_num)]
@@ -153,6 +155,10 @@ if __name__ == "__main__":
 
     if timing:
         start_time = time.time()
+
+    if cal_cost:
+        weight_cost = 0
+        ego_cost = 0
 
     if mode in ["fedavg", "fedprox"]:
         for epoch in range(1, args.epochs + 1):
@@ -183,6 +189,12 @@ if __name__ == "__main__":
                 min_local_loss = min(min_local_loss, local_avg_loss[-1])
                 test_avg_f1.append(np.mean(test_f1))
                 max_test_avg_f1 = max(max_test_avg_f1, test_avg_f1[-1])
+
+            if cal_cost:
+                for key in clients[0].state_dict().keys():
+                    weight_cost += sys.getsizeof(clients[0].state_dict()
+                                                 [key].storage())/1024/1024*client_num
+                print("upload weight cost:", weight_cost)
 
             print("-----epoch",
                   epoch,
@@ -247,22 +259,28 @@ if __name__ == "__main__":
 
         print("max local avg f1:", max_local_avg_f1)
         print("max global avg f1:", max_test_avg_f1)
-    elif mode in ["fedego", "fedego_nr", "fedego_np", "local"]:
+    elif mode in ["fedego", "fedego_nr", "fedego_np", "fedego_ne", "local"]:
         shallowKeys = []
         deepKeys = []
         for epoch in range(1, args.epochs + 1):
             with torch.no_grad():
-                """reduction layers"""
-                w_avg = FedAvg([clients[i].state_dict()
-                               for i in range(client_num)])
-
                 if mode in ["fedego", "fedego_np"]:
+                    """reduction layers"""
+                    w_avg = FedAvg([clients[i].state_dict()
+                                   for i in range(client_num)])
+
                     if epoch == 1:
                         for key in w_avg.keys():
-                            if (key.startswith("lowLayer")):
-                                shallowKeys.append(key)
+                            if mode in ["fedego_ne"]:
+                                if (key.startswith("gnnLayer")):
+                                    shallowKeys.append(key)
+                                else:
+                                    deepKeys.append(key)
                             else:
-                                deepKeys.append(key)
+                                if (key.startswith("lowLayer")):
+                                    shallowKeys.append(key)
+                                else:
+                                    deepKeys.append(key)
 
                     shallow_dict = {k: w_avg[k] for k in shallowKeys}
                     for cid in range(client_num):
@@ -271,8 +289,22 @@ if __name__ == "__main__":
             """train"""
             clients_share_x, clients_share_y, clients_share_mask, clients_share_edge_index, loss_list = fedegoWork(
                 clients, client_num, client_train_epoch, batch_size)
+            if cal_cost:
+                ego_cost += sys.getsizeof(clients_share_x.storage())/1024/1024
+                ego_cost += sys.getsizeof(clients_share_y.storage())/1024/1024
+                ego_cost += sys.getsizeof(clients_share_mask.storage()
+                                          )/1024/1024
+                ego_cost += sys.getsizeof(clients_share_edge_index.storage()
+                                          )/1024/1024
+                for key in clients[0].state_dict().keys():
+                    if key in deepKeys:
+                        continue
+                    weight_cost += sys.getsizeof(clients[0].state_dict()
+                                                 [key].storage())/1024/1024*client_num
+                print("upload ego cost:", ego_cost, "weight cost:",
+                      weight_cost, "total cost:", ego_cost+weight_cost, flush=True)
 
-            if mode in ["fedego", "fedego_nr"]:
+            if mode in ["fedego", "fedego_nr", "fedego_ne"]:
                 with torch.no_grad():
                     server.loadData(clients_share_x, clients_share_edge_index,
                                     clients_share_y, clients_share_mask)
@@ -295,7 +327,7 @@ if __name__ == "__main__":
                         print(f"{clients[cid].lamb:.3f}", end=" ", flush=True)
                     print()
 
-            if mode in ["fedego", "fedego_nr"]:
+            if mode in ["fedego", "fedego_nr", "fedego_ne"]:
                 with torch.no_grad():
                     server_dict = server.state_dict()
                     """update in the personalization layers"""
@@ -330,14 +362,8 @@ if __name__ == "__main__":
                               local_avg_f1[-1], global_step=epoch)
             writer.add_scalar(
                 f"test avg f1:", test_avg_f1[-1], global_step=epoch)
-            print("-----epoch",
-                  epoch,
-                  "test f1:",
-                  test_avg_f1[-1],
-                  "| local f1:",
-                  local_avg_f1[-1],
-                  " -----",
-                  flush=True)
+            print("-----epoch", epoch, "test f1:",
+                  test_avg_f1[-1], "| local f1:", local_avg_f1[-1], " -----", flush=True)
 
             if epoch > early_stopping and local_avg_loss[-1] / min_local_loss > early_stopping_bound:
                 print("Early stopping...")
@@ -371,7 +397,7 @@ if __name__ == "__main__":
                     cur_load = copy.deepcopy(w_last[cid])
                     for k in cur_load.keys():
                         for i in range(-1, 2):
-                            if i==0:
+                            if i == 0:
                                 continue
                             cur_load[k] += w_last[(cid+i+client_num) %
                                                   client_num][k]
@@ -395,14 +421,8 @@ if __name__ == "__main__":
                 test_avg_f1.append(np.mean(test_f1))
                 max_test_avg_f1 = max(max_test_avg_f1, test_avg_f1[-1])
 
-            print("-----epoch",
-                  epoch,
-                  "test f1:",
-                  test_avg_f1[-1],
-                  "| local f1:",
-                  local_avg_f1[-1],
-                  " -----",
-                  flush=True)
+            print("-----epoch", epoch, "test f1:", test_avg_f1[-1],
+                  "| local f1:", local_avg_f1[-1], " -----", flush=True)
 
             if epoch > early_stopping and local_avg_loss[-1] / min_local_loss > early_stopping_bound:
                 print("Early stopping...")
@@ -418,45 +438,9 @@ if __name__ == "__main__":
         data = getattr(dataCenter, ds + "_total_data")
         test_index = getattr(dataCenter, ds + "_test_index")
 
-        # total_node_num = data.x.shape[0]
-        # adj = torch.zeros(total_node_num, total_node_num)
-        # for edge in data.edge_index:
-        #     adj[edge[0]][edge[1]] = 1
-        #     adj[edge[1]][edge[0]] = 1
-        # adj = normalize(adj)
-        # test_adj = adj[test_index][:, test_index]
+        total_communicate, test_adj = fedgcnInit(data,
+                                                 clients, client_num, index_list, test_data)
 
-        # init the adj
-        test_node_num = test_data.x.shape[0]
-        test_adj = torch.zeros(test_node_num, test_node_num)
-        for edge in test_data.edge_index:
-            test_adj[edge[0]][edge[1]] = 1
-            test_adj[edge[1]][edge[0]] = 1
-        test_adj = normalize(test_adj)
-
-        # calculate the sum of the feature
-        total_communicate = torch.zeros(data.x.shape)
-        cnt=torch.zeros(data.x.shape[0])
-        for cid in range(client_num):
-            node_num = clients[cid].data.x.shape[0]
-            index = index_list[cid]
-            clients[cid].adj = torch.zeros(node_num, node_num)
-            for edge in clients[cid].data.edge_index:
-                clients[cid].adj[edge[0]][edge[1]] = 1
-                clients[cid].adj[edge[1]][edge[0]] = 1
-            clients[cid].adj = normalize(clients[cid].adj)
-            # clients[cid].adj = adj[index_list[cid]][:, index_list[cid]]
-            clients[cid].communicate = clients[cid].adj.mm(clients[cid].data.x)
-            for node in range(node_num):
-                total_communicate[index[node]
-                                  ] += clients[cid].communicate[node]
-                cnt[index[node]]+=1
-
-        for node in range(data.x.shape[0]):
-            if cnt[node]==0:
-                continue
-            total_communicate[node]/=cnt[node]
-            
         # load the aggregated feature
         for cid in range(client_num):
             node_num = clients[cid].data.x.shape[0]
@@ -486,14 +470,8 @@ if __name__ == "__main__":
                 test_avg_f1.append(np.mean(test_f1))
                 max_test_avg_f1 = max(max_test_avg_f1, test_avg_f1[-1])
 
-            print("-----epoch",
-                  epoch,
-                  "test f1:",
-                  test_avg_f1[-1],
-                  "| local f1:",
-                  local_avg_f1[-1],
-                  " -----",
-                  flush=True)
+            print("-----epoch", epoch, "test f1:", test_avg_f1[-1],
+                  "| local f1:", local_avg_f1[-1], " -----", flush=True)
 
             if epoch > early_stopping and local_avg_loss[-1] / min_local_loss > early_stopping_bound:
                 print("Early stopping...")
@@ -514,5 +492,8 @@ if __name__ == "__main__":
         print((end_time-start_time)/60, "min or", (end_time-start_time), "s")
         print((end_time-start_time)//60, "min +",
               (end_time-start_time) % 60, "s")
-    print("add local",np.mean(max_local_f1))
-    print("add test",np.mean(max_test_f1))
+    print("add local", np.mean(max_local_f1))
+    print("add test", np.mean(max_test_f1))
+    if cal_cost:
+        print("upload ego cost:", ego_cost, "weight cost:",
+              weight_cost, "total cost:", ego_cost+weight_cost, flush=True)

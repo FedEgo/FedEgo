@@ -1,15 +1,16 @@
 from torch_geometric.data.data import Data
 from collections import defaultdict
-from torch_geometric.loader import NeighborLoader
+from torch_geometric.loader import NeighborLoader, DataLoader
 from models import *
 import numpy as np
 import torch.nn as nn
 from sklearn.metrics import f1_score
 from torch.optim import *
 
+
 class Client(nn.Module):
     def __init__(self, data, mode, sageMode, in_feats, h_feats, num_classes, test_num, lr, dropout,
-                 device, mixup):
+                 device, mixup, linear):
         super(Client, self).__init__()
         self.data = data
         self.mode = mode
@@ -22,14 +23,20 @@ class Client(nn.Module):
         self.device = device
         self.prox_miu = 1.0
         self.mixup = mixup
+        self.linear = linear
 
-        self.lowLayer = LowLayer(in_feats, h_feats).to(self.device)
-        self.gnnLayer = GNNLayer(
-            sageMode, h_feats, h_feats, h_feats, layer_size=2).to(self.device)
+        if self.mode in ["fedego_ne"]:
+            self.lowLayer = LowLayer(h_feats, h_feats).to(self.device)
+            self.gnnLayer = GNNLayer(
+                sageMode, in_feats, h_feats, h_feats, linear, layer_size=2).to(self.device)
+        else:
+            self.lowLayer = LowLayer(in_feats, h_feats).to(self.device)
+            self.gnnLayer = GNNLayer(
+                sageMode, h_feats, h_feats, h_feats, linear, layer_size=2).to(self.device)
         self.classification = Classification(
             h_feats, num_classes).to(self.device)
-        if self.mode == "fedego":
-            self.dropout = nn.Dropout(p=dropout)
+
+        self.dropout = nn.Dropout(p=dropout)
 
         if self.mode in ["fedgcn"]:
             self.fedgcn = FedGCN(
@@ -76,7 +83,7 @@ class Client(nn.Module):
         elif mode == "val":
             data = self.data
             input_nodes = self.val_mask
-        elif mode == "share":
+        elif mode in ["share"]:
             data = self.lowEmbed
             input_nodes = self.train_mask
         elif mode == "test":
@@ -155,13 +162,16 @@ class Client(nn.Module):
         node_layer = [[] for l in range(layer)]
         # node 0, use node 0 to be uploaded if Mixup is not applied
         if self.mixup:
-            node_layer[0] = [node for node in range(b_size)]
+            node_layer[0] = np.arange(b_size, dtype=np.int64).tolist()
         else:
-            node_layer[0] = [0 for node in range(b_size)]
+            node_layer[0] = np.zeros(b_size, dtype=np.int64).tolist()
 
         for l in range(1, layer):
             for node in node_layer[l - 1]:
                 node_layer[l] += adj_lists[node]
+
+        for l in range(layer):
+            node_layer[l] = np.array(node_layer[l], dtype=np.int64)
 
         share_x = torch.zeros((43, self.h_feats))
         share_y = torch.zeros((43, self.num_classes))
@@ -175,17 +185,45 @@ class Client(nn.Module):
         # Mixup
         for l in range(layer):
             layer_length = len(self.map_layer[l])
-            for i in range(len(node_layer[l])):
-                share_x[self.map_layer[l][i %
-                                          layer_length]] += x[node_layer[l][i]]
-                share_y[self.map_layer[l][i %
-                                          layer_length]] += y[node_layer[l][i]]
+            batch_layer_length = len(node_layer[l])
+            pos = [[] for _ in range(layer_length)]
+            for i in range(batch_layer_length):
+                pos[i % layer_length].append(node_layer[l][i])
+            pos = torch.tensor(pos)
+            for i in range(layer_length):
+                share_x[self.map_layer[l][i]] = torch.sum(x[pos[i]], dim=0)
+                share_y[self.map_layer[l][i]] = torch.sum(y[pos[i]], dim=0)
         share_x /= b_size
         share_y /= b_size
         self.share_x.append(share_x)
         self.share_y.append(share_y)
         self.share_node_idx.append(self.share_node_cnt)
         self.share_node_cnt += 43
+
+    @torch.no_grad()
+    def updateShareBatchNe(self, batch, layer=3):
+        b_size = batch.batch_size
+        x = batch.x.cpu()
+        y = batch.y
+        y = F.one_hot(y, num_classes=self.num_classes).float().cpu()
+
+        share_x = torch.zeros((43, self.h_feats))
+        share_y = torch.zeros((43, self.num_classes))
+
+        self.share_edge_index_u += [self.share_node_cnt]
+        self.share_edge_index_v += [self.share_node_cnt]
+
+        # Mixup
+        share_x = torch.sum(x[:b_size], dim=0)
+        share_y = torch.sum(y[:b_size], dim=0)
+        share_x /= b_size
+        share_y /= b_size
+        share_x = share_x.view([1, -1])
+        share_y = share_y.view([1, -1])
+        self.share_x.append(share_x)
+        self.share_y.append(share_y)
+        self.share_node_idx.append(self.share_node_cnt)
+        self.share_node_cnt += 1
 
     @torch.no_grad()
     def setLamb(self, global_p, lamb_c, lamb_fixed=False):
@@ -202,7 +240,11 @@ class Client(nn.Module):
     @torch.no_grad()
     def getLowEmbed(self):
         x = self.data.x.to(self.device)
-        x = self.lowLayer(x)
+        edge_index = self.data.edge_index.to(self.device)
+        if self.mode in ["fedego_ne"]:
+            x = self.gnnLayer(x, edge_index)
+        else:
+            x = self.lowLayer(x)
         self.lowEmbed = Data(
             x=x, edge_index=self.data.edge_index, y=self.data.y)
 
@@ -217,7 +259,10 @@ class Client(nn.Module):
         train_loader = self.getLoader(batch_size, mode="share")
 
         for batch in train_loader:
-            self.updateShareBatch(batch)
+            if self.mode in ["fedego_ne"]:
+                self.updateShareBatchNe(batch)
+            else:
+                self.updateShareBatch(batch)
 
         self.share_x = torch.cat(self.share_x, 0).detach()
         self.share_y = torch.cat(self.share_y, 0).detach()
@@ -238,8 +283,8 @@ class Client(nn.Module):
 
         train_loader = self.getLoader(batch_size, mode="train")
         total_examples = total_loss = 0
-        
-        if self.mode == "fedego":
+
+        if self.mode in ["fedego", "fedego_np", "fedego_nr"]:
             for batch in train_loader:
                 self.optimizer.zero_grad()
                 batch = batch.to(self.device)
@@ -251,6 +296,27 @@ class Client(nn.Module):
                 x = self.lowLayer(x)
                 x = self.dropout(x)
                 x = self.gnnLayer(x, edge_index)
+                x = self.dropout(x)
+                out = self.classification(x)[:b_size]
+                loss = self.getLoss(out, y[:b_size])
+
+                loss.backward()
+                self.optimizer.step()
+
+                total_examples += b_size
+                total_loss += float(loss) * b_size
+        elif self.mode in ["fedego_ne"]:
+            for batch in train_loader:
+                self.optimizer.zero_grad()
+                batch = batch.to(self.device)
+                b_size = batch.batch_size
+                x = batch.x
+                y = batch.y
+                edge_index = batch.edge_index
+
+                x = self.gnnLayer(x, edge_index)
+                x = self.dropout(x)
+                x = self.lowLayer(x)
                 x = self.dropout(x)
                 out = self.classification(x)[:b_size]
                 loss = self.getLoss(out, y[:b_size])
@@ -352,9 +418,14 @@ class Client(nn.Module):
             edge_index = batch.edge_index
             y = batch.y
 
-            x = self.lowLayer(x)
-            x = self.gnnLayer(x, edge_index)
-            out = self.classification(x)[:b_size]
+            if self.mode in ["fedego_ne"]:
+                x = self.gnnLayer(x, edge_index)
+                x = self.lowLayer(x)
+                out = self.classification(x)[:b_size]
+            else:
+                x = self.lowLayer(x)
+                x = self.gnnLayer(x, edge_index)
+                out = self.classification(x)[:b_size]
             pred = out.argmax(dim=-1)
 
             pred_all += pred.tolist()
@@ -389,9 +460,14 @@ class Client(nn.Module):
             edge_index = batch.edge_index
             y = batch.y
 
-            x = self.lowLayer(x)
-            x = self.gnnLayer(x, edge_index)
-            out = self.classification(x)[:b_size]
+            if self.mode in ["fedego_ne"]:
+                x = self.gnnLayer(x, edge_index)
+                x = self.lowLayer(x)
+                out = self.classification(x)[:b_size]
+            else:
+                x = self.lowLayer(x)
+                x = self.gnnLayer(x, edge_index)
+                out = self.classification(x)[:b_size]
             pred = out.argmax(dim=-1)
 
             pred_all += pred.tolist()

@@ -7,20 +7,23 @@ from torch.optim import *
 
 
 class Server(nn.Module):
-    def __init__(self, mode, sageMode, h_feats, num_classes, lr, dropout, device):
+    def __init__(self, mode, sageMode, h_feats, num_classes, lr, dropout, device, linear):
         super(Server, self).__init__()
         self.mode = mode
         self.sageMode = sageMode
         self.h_feats = h_feats
         self.num_classes = num_classes
         self.device = device
+        self.linear = linear
 
-        self.gnnLayer = GNNLayer(
-            sageMode, h_feats, h_feats, h_feats, 2).to(self.device)
+        if self.mode in ["fedego_ne"]:
+            self.lowLayer = LowLayer(h_feats, h_feats).to(self.device)
+        else:
+            self.gnnLayer = GNNLayer(
+                sageMode, h_feats, h_feats, h_feats, linear, 2).to(self.device)
         self.classification = Classification(
             h_feats, num_classes).to(self.device)
-        if self.mode in ["fedego", "fedego_nr"]:
-            self.dropout = nn.Dropout(p=dropout)
+        self.dropout = nn.Dropout(p=dropout)
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
@@ -78,6 +81,21 @@ class Server(nn.Module):
                 b_size = batch.batch_size
 
                 x = self.gnnLayer(batch.x, batch.edge_index)
+                x = self.dropout(x)
+                out = self.classification(x)[:b_size]
+                loss = self.getLoss(out, batch.y[:b_size])
+
+                loss.backward()
+                self.optimizer.step()
+
+                total_examples += b_size
+                total_loss += float(loss) * b_size
+        elif self.mode in ["fedego_ne"]:
+            for batch in train_loader:
+                self.optimizer.zero_grad()
+                batch = batch.to(self.device)
+                b_size = batch.batch_size
+                x = self.lowLayer(batch.x)
                 x = self.dropout(x)
                 out = self.classification(x)[:b_size]
                 loss = self.getLoss(out, batch.y[:b_size])

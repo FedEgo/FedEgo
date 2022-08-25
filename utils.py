@@ -171,6 +171,7 @@ def graphflWork(clients, client_num, client_train_epoch, batch_size):
             clients[cid].load_state_dict(w_avg)
     return maml_sloss_list, maml_vloss_list, fl_loss_list
 
+
 def fedgcnJob(client, client_train_epoch, batch_size, qloss):
     loss = []
     for i in range(client_train_epoch):
@@ -195,14 +196,100 @@ def fedgcnWork(clients, client_num, client_train_epoch, batch_size):
 
 
 """normalize the adj"""
+
+
 def normalize(A):
     # A = A+I
     A = A + torch.eye(A.size(0))
     # degree of the nodes
     d = A.sum(1)
-    D =torch.diag(torch.pow(d , -1))
+    D = torch.diag(torch.pow(d, -1))
     return D.mm(A)
+
 
 def printWD(clients, client_num, image_url, r1=3, r2=2, r3=1):
     pass
 
+
+def fedgcnInit(data,clients, client_num, index_list, test_data):
+    # init the adj
+    test_node_num = test_data.x.shape[0]
+    test_adj = torch.zeros(test_node_num, test_node_num)
+    for edge in test_data.edge_index:
+        test_adj[edge[0]][edge[1]] = 1
+        test_adj[edge[1]][edge[0]] = 1
+    test_adj = normalize(test_adj)
+
+    # calculate the sum of the feature
+    total_communicate = torch.zeros(data.x.shape)
+    cnt = torch.zeros(data.x.shape[0])
+    for cid in range(client_num):
+        node_num = clients[cid].data.x.shape[0]
+        index = index_list[cid]
+        clients[cid].adj = torch.zeros(node_num, node_num)
+        for edge in clients[cid].data.edge_index:
+            clients[cid].adj[edge[0]][edge[1]] = 1
+            clients[cid].adj[edge[1]][edge[0]] = 1
+        clients[cid].adj = normalize(clients[cid].adj)
+        clients[cid].communicate = clients[cid].adj.mm(clients[cid].data.x)
+        for node in range(node_num):
+            total_communicate[index[node]
+                              ] += clients[cid].communicate[node]
+            cnt[index[node]] += 1
+
+    for node in range(data.x.shape[0]):
+        if cnt[node] == 0:
+            continue
+        total_communicate[node] /= cnt[node]
+    
+    return total_communicate,test_adj
+
+def fedegoNeJob(client, client_train_epoch, batch_size, qloss, qx, qy, qedge, qmask):
+    loss = []
+    with torch.no_grad():
+        client.initShareBatch()
+    for i in range(client_train_epoch):
+        loss.append(client.supervisedTrain(batch_size))
+    with torch.no_grad():
+        share_x, share_edge_index, share_y, share_mask = client.getShareBatch(
+            batch_size)
+        qloss.put(loss)
+        qx.put(share_x)
+        qy.put(share_y)
+        qedge.put(share_edge_index)
+        qmask.put(share_mask)
+
+
+def fedegoNeWork(clients, client_num, client_train_epoch, batch_size):
+    clients_share_x = []
+    clients_share_y = []
+    clients_share_edge_index = []
+    clients_share_mask = []
+    loss_list = []
+    qloss = Queue()
+    qx = Queue()
+    qy = Queue()
+    qedge = Queue()
+    qmask = Queue()
+    threads = []
+    for cid in range(client_num):
+        t = threading.Thread(target=fedegoNeJob,
+                             args=(clients[cid], client_train_epoch, batch_size, qloss,
+                                   qx, qy, qedge, qmask))
+        t.start()
+        threads.append(t)
+    for thread in threads:
+        thread.join()
+    with torch.no_grad():
+        for _ in range(client_num):
+            clients_share_x.append(qx.get())
+            clients_share_y.append(qy.get())
+            clients_share_edge_index.append(qedge.get())
+            clients_share_mask.append(qmask.get())
+            loss_list.append(qloss.get())
+        clients_share_x = torch.cat(clients_share_x, 0).cpu()
+        clients_share_y = torch.cat(clients_share_y, 0).cpu()
+        clients_share_mask = torch.cat(clients_share_mask, 0).cpu()
+        clients_share_edge_index = torch.cat(clients_share_edge_index, 1).cpu()
+
+    return clients_share_x, clients_share_y, clients_share_mask, clients_share_edge_index, loss_list

@@ -21,11 +21,14 @@ def args_parser():
     parser.add_argument("--server_train_epoch", type=int, default=5)
     parser.add_argument("--test_num", type=int, default=300)
     parser.add_argument("--early_stopping", type=int, default=100)
+    parser.add_argument("--cal_cost", action="store_true", help="calculate communication cost")
+    parser.add_argument("--linear", action="store_true", help="linear personalization layers")
+    
 
     parser.add_argument("--mode",
                         type=str,
                         default="fedego",
-                        help="fedavg, local, fedego_np, fedego_nr, fedego, fedprox, dfedgnn, fedgcn")
+                        help="fedavg, local, fedego_np, fedego_nr, fedego, fedprox, dfedgnn, fedgcn,fedego_ne")
 
     parser.add_argument("--client_num", type=int, default=10)
     parser.add_argument("--sample_rate", type=float, default=0.3)
