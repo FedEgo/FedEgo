@@ -48,13 +48,6 @@ if __name__ == "__main__":
         args.test_num = 200
         args.h_feats = 512
         args.epochs = 200
-        if args.dataSet == "citeseer":
-            # pass
-            lamb_map = {1027: 0.125, 1107: 0.375, 2333: 0.75, 9973: 0.25}
-            args.lamb_c = lamb_map[args.seed]
-        if args.dataSet == "cora":
-            lamb_map = {1027: 0.125, 1107: 0.125, 2333: 0.125, 9973: 0.25}
-            args.lamb_c = lamb_map[args.seed]
     elif args.dataSet in ["wiki"]:
         args.client_num = 10
         args.sample_rate = 0.2
@@ -63,9 +56,6 @@ if __name__ == "__main__":
         if args.mode in ["fedego"]:
             args.epochs = 300
             args.lr = 5e-4
-        #     args.learning_rate = 0.01
-        lamb_map = {1027: 0.75, 1107: 0.5, 2333: 0.75, 9973: 0.75}
-        args.lamb_c = lamb_map[args.seed]
     elif args.dataSet in ["corafull"]:
         args.client_num = 10
         args.learning_rate = 3e-4
@@ -74,8 +64,6 @@ if __name__ == "__main__":
         args.h_feats = 512
         if args.mode in ["fedego"]:
             args.lr = 5e-4
-        lamb_map = {1027: 0.25, 1107: 0.125, 2333: 0.125, 9973: 0.25}
-        args.lamb_c = lamb_map[args.seed]
 
     client_train_epoch = args.client_train_epoch
     server_train_epoch = args.server_train_epoch

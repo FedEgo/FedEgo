@@ -36,7 +36,7 @@ def args_parser():
     parser.add_argument("--major_rate", type=float, default=0.8)
     parser.add_argument("--share_node_num", type=int, default=500)
     parser.add_argument("--major_label", type=int, default=3)
-    parser.add_argument("--lamb_c", type=float, default=1)
+    parser.add_argument("--lamb_c", type=float, default=0.5)
     parser.add_argument("--lamb_fixed", type=int, default=0)
     parser.add_argument("--mixup", type=int, default=1)
     parser.add_argument("--sageMode", type=str,
