@@ -22,7 +22,7 @@ if torch.cuda.is_available():
         print("using device", device_id, torch.cuda.get_device_name(device_id))
 
 # device = torch.device("cuda" if args.cuda else "cpu")
-device = "cuda:0"
+device = "cuda:3"
 print("DEVICE:", device, flush=True)
 
 if __name__ == "__main__":
@@ -64,6 +64,8 @@ if __name__ == "__main__":
         args.h_feats = 512
         if args.mode in ["fedego"]:
             args.lr = 5e-4
+    elif args.dataSet in ["FedDBLP"]:
+        args.client_num = 7
 
     client_train_epoch = args.client_train_epoch
     server_train_epoch = args.server_train_epoch
@@ -84,6 +86,7 @@ if __name__ == "__main__":
     early_stopping_bound = 1.3
     cal_cost = args.cal_cost
     linear = args.linear
+    sigma = args.sigma
 
     logUrl = "./log/" + args.dataSet + "_" + mode
     image_url = "./images/" + args.dataSet + "/" + mode
@@ -107,7 +110,7 @@ if __name__ == "__main__":
     ds = args.dataSet
     dataCenter = DataCenter(config, client_num, device)
     dataCenter.load_dataSet(args.sample_rate, args.global_sample_rate, major_rate,
-                            test_num, major_label, ds)
+                            test_num, major_label, ds, args.split_mode)
     print("load data finished ", flush=True)
 
     data = getattr(dataCenter, ds + "_data")
@@ -118,7 +121,7 @@ if __name__ == "__main__":
     # init clients
     clients = [
         Client(data[i], mode, sageMode, in_feats, h_feats, num_classes, test_num, lr, dropout,
-               device, mixup, linear).to(device) for i in range(client_num)
+               device, mixup, linear, sigma).to(device) for i in range(client_num)
     ]
 
     print("clients init finished ", flush=True)
@@ -464,6 +467,102 @@ if __name__ == "__main__":
             if epoch > early_stopping and local_avg_loss[-1] / min_local_loss > early_stopping_bound:
                 print("Early stopping...")
                 break
+
+        print("max local f1:", max_local_f1)
+        print("max test f1:", max_test_f1)
+
+        print("max local avg f1:", max_local_avg_f1)
+        print("max global avg f1:", max_test_avg_f1)
+    
+    elif mode in ["fedsage", "fedsageplus"]:
+        # Code adapted from FederatedScope
+        # https://github.com/alibaba/FederatedScope
+        r"""
+        FedSage+ consists of three of training stages.
+        Stage1: 0, local pre-train for generator.
+        Stage2: -> 2 * fedgen_epoch, federated training for generator.
+        Stage3: -> 2 * fedgen_epoch + total_round_num: federated training
+        for GraphSAGE Classifier
+        """
+        total_round_num = args.epochs
+        fedgen_epoch = args.fedgen_epoch * 2
+        total_round_num = total_round_num + fedgen_epoch
+
+        if mode in ["fedsage"]:
+            start_epoch = fedgen_epoch + 1
+        elif mode in ["fedsageplus"]:
+            start_epoch = 1
+            
+        if mode in ["fedsageplus"]:
+            # step1: local pre-train for generator
+            content_list = LocalGenWork(clients, client_num, args.gen_train_epochs)
+            contents = [[] for _ in range(client_num)]
+            for con in content_list:
+                contents[con[-1]] = con[:-1]
+
+        for epoch in range(start_epoch, total_round_num + 1):
+
+            if mode in ["fedsageplus"]:
+                # step2: federated training for generator
+                if epoch <= fedgen_epoch and epoch % 2 == 1:
+                    gradient_dict = FedGenWork(clients, client_num, contents)
+                    gen_grads = SumUpGradient(gradient_dict)
+                if epoch <= fedgen_epoch and epoch % 2 == 0:
+                    content_list = UpdateGenWork(clients, client_num, gen_grads)
+                    contents = [[] for _ in range(client_num)]
+                    for con in content_list:
+                        contents[con[-1]] = con[:-1]
+                # step3: federated training
+                if epoch == fedgen_epoch + 1:
+                    for cid in range(client_num):
+                        clients[cid].setup_fedsage()
+            if epoch > fedgen_epoch:
+                with torch.no_grad():
+                    w_avg = FedAvg([clients[i].state_dict()
+                                for i in range(client_num)])
+                    for cid in range(client_num):
+                        clients[cid].load_state_dict(w_avg)
+                        clients[cid].init_model = w_avg
+
+                loss_list = fedavgWork(clients, client_num,
+                                    client_train_epoch, batch_size)
+                
+                with torch.no_grad():
+                    """load the averaged model of clients"""
+                    with torch.no_grad():
+                        w_avg = FedAvg([clients[i].state_dict()
+                                    for i in range(client_num)])
+                    for cid in range(client_num):
+                        local_f1[cid], local_loss[cid] = clients[cid].evaluate(
+                            batch_size)
+                        test_f1[cid] = clients[cid].test(test_data, batch_size)
+                        max_local_f1[cid] = max(max_local_f1[cid], local_f1[cid])
+                        max_test_f1[cid] = max(max_test_f1[cid], test_f1[cid])
+                    local_avg_f1.append(np.mean(local_f1))
+                    max_local_avg_f1 = max(max_local_avg_f1, local_avg_f1[-1])
+                    local_avg_loss.append(np.mean(local_loss))
+                    min_local_loss = min(min_local_loss, local_avg_loss[-1])
+                    test_avg_f1.append(np.mean(test_f1))
+                    max_test_avg_f1 = max(max_test_avg_f1, test_avg_f1[-1])
+                
+                if cal_cost:
+                    for key in clients[0].state_dict().keys():
+                        weight_cost += sys.getsizeof(clients[0].state_dict()
+                                                    [key].storage())/1024/1024*client_num
+                    print("upload weight cost:", weight_cost)
+
+                print("-----epoch",
+                    epoch,
+                    "test f1:",
+                    test_avg_f1[-1],
+                    "| local f1:",
+                    local_avg_f1[-1],
+                    " -----",
+                    flush=True)
+
+                if epoch > early_stopping and local_avg_loss[-1] / min_local_loss > early_stopping_bound:
+                    print("Early stopping...")
+                    break
 
         print("max local f1:", max_local_f1)
         print("max test f1:", max_test_f1)

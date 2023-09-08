@@ -6,11 +6,14 @@ import numpy as np
 import torch.nn as nn
 from sklearn.metrics import f1_score
 from torch.optim import *
+from utils import HideGraph, GreedyLoss, GraphMender
+import torch.nn.functional as F
+import copy
 
 
 class Client(nn.Module):
     def __init__(self, data, mode, sageMode, in_feats, h_feats, num_classes, test_num, lr, dropout,
-                 device, mixup, linear):
+                 device, mixup, linear, sigma=0, gen_hidden=64, hide_portion=0.5):
         super(Client, self).__init__()
         self.data = data
         self.mode = mode
@@ -19,20 +22,26 @@ class Client(nn.Module):
         self.h_feats = h_feats
         self.num_classes = num_classes
         self.test_num = test_num
+        self.lr = lr
         self.node_num = self.data.x.shape[0]
         self.device = device
         self.prox_miu = 1.0
         self.mixup = mixup
         self.linear = linear
+        self.sigma = sigma
 
         if self.mode in ["fedego_ne"]:
             self.lowLayer = LowLayer(h_feats, h_feats).to(self.device)
             self.gnnLayer = GNNLayer(
                 sageMode, in_feats, h_feats, h_feats, linear, layer_size=2).to(self.device)
         else:
-            self.lowLayer = LowLayer(in_feats, h_feats).to(self.device)
-            self.gnnLayer = GNNLayer(
-                sageMode, h_feats, h_feats, h_feats, linear, layer_size=2).to(self.device)
+            if self.mode not in ["fedsage", "fedsageplus"]:
+                self.lowLayer = LowLayer(in_feats, h_feats).to(self.device)
+                self.gnnLayer = GNNLayer(
+                    sageMode, h_feats, h_feats, h_feats, linear, layer_size=2).to(self.device)
+            else:
+                self.gnnLayer = GNNLayer(
+                    sageMode, in_feats, h_feats, h_feats, linear, layer_size=2).to(self.device)
         self.classification = Classification(
             h_feats, num_classes).to(self.device)
 
@@ -41,6 +50,26 @@ class Client(nn.Module):
         if self.mode in ["fedgcn"]:
             self.fedgcn = FedGCN(
                 in_feats, h_feats, num_classes).to(self.device)
+        
+        if self.mode in ["fedsageplus"]:
+            self.num_pred = 5
+            self.a = 1.0
+            self.b = 1.0
+            self.c = 1.0
+            self.getMask()
+            self.data.train_mask = self.train_mask
+            self.data.val_mask = self.val_mask
+            self.data.test_mask = self.test_mask
+            self.hide_data = HideGraph(hide_portion, self.num_pred)(self.data)
+            self.local_gen = LocalSage_Plus(self.data.x.shape[-1],
+                                      num_classes,
+                                      h_feats,
+                                      gen_hidden,
+                                      linear,
+                                      dropout,
+                                      num_pred=self.num_pred).to(self.device)
+            self.criterion_num = F.smooth_l1_loss
+            self.criterion_feat = GreedyLoss
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         self.init()
@@ -195,6 +224,8 @@ class Client(nn.Module):
                 share_y[self.map_layer[l][i]] = torch.sum(y[pos[i]], dim=0)
         share_x /= b_size
         share_y /= b_size
+        share_x += self.sigma * torch.randn((43, self.h_feats))
+            
         self.share_x.append(share_x)
         self.share_y.append(share_y)
         self.share_node_idx.append(self.share_node_cnt)
@@ -326,6 +357,24 @@ class Client(nn.Module):
 
                 total_examples += b_size
                 total_loss += float(loss) * b_size
+        elif self.mode in ["fedsage", "fedsageplus"]:
+            for batch in train_loader:
+                self.optimizer.zero_grad()
+                batch = batch.to(self.device)
+                b_size = batch.batch_size
+                x = batch.x
+                y = batch.y
+                edge_index = batch.edge_index
+
+                x = self.gnnLayer(x, edge_index)
+                out = self.classification(x)[:b_size]
+                loss = F.cross_entropy(out, y[:b_size])
+
+                loss.backward()
+                self.optimizer.step()
+
+                total_examples += b_size
+                total_loss += float(loss) * b_size
         else:
             for batch in train_loader:
                 self.optimizer.zero_grad()
@@ -422,6 +471,9 @@ class Client(nn.Module):
                 x = self.gnnLayer(x, edge_index)
                 x = self.lowLayer(x)
                 out = self.classification(x)[:b_size]
+            elif self.mode in ["fedsage", "fedsageplus"]:
+                x = self.gnnLayer(x, edge_index)
+                out = self.classification(x)[:b_size]
             else:
                 x = self.lowLayer(x)
                 x = self.gnnLayer(x, edge_index)
@@ -463,6 +515,9 @@ class Client(nn.Module):
             if self.mode in ["fedego_ne"]:
                 x = self.gnnLayer(x, edge_index)
                 x = self.lowLayer(x)
+                out = self.classification(x)[:b_size]
+            elif self.mode in ["fedsage", "fedsageplus"]:
+                x = self.gnnLayer(x, edge_index)
                 out = self.classification(x)[:b_size]
             else:
                 x = self.lowLayer(x)
@@ -579,3 +634,143 @@ class Client(nn.Module):
             print((np.array(distibution)/len(pred_all)).tolist())
         micro_f1 = f1_score(y_all, pred_all, average='micro')
         return micro_f1
+
+    def local_pre_train(self):
+        self.train()
+        data = self.hide_data.to(self.device)
+        self.criterion_num = F.smooth_l1_loss
+        self.criterion_feat = GreedyLoss
+
+        self.optimizer.zero_grad()
+        pred_missing, pred_feat, nc_pred = self.local_gen(data)
+        pred_missing, pred_feat, nc_pred = pred_missing[data.train_mask], pred_feat[data.train_mask], nc_pred[data.train_mask]
+        loss_num = self.criterion_num(pred_missing, data.num_missing[data.train_mask])
+        loss_feat = self.criterion_feat(
+            pred_feats=pred_feat,
+            true_feats=data.x_missing[data.train_mask],
+            pred_missing=pred_missing,
+            true_missing=data.num_missing[data.train_mask],
+            num_pred=self.num_pred
+        ).requires_grad_()
+        loss_clf = F.cross_entropy(nc_pred, data.y[data.train_mask])
+        loss = (self.a * loss_num + self.b * loss_feat + self.c * loss_clf).float()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+    
+    def build_fedgen(self):
+        self.fed_gen = FedSage_Plus(self.local_gen).to(self.device)
+        return self.fed_gen.state_dict()
+
+    def fed_gen_train(self, client_num):
+        self.train()
+        data = self.hide_data.to(self.device)
+
+        self.optimizer.zero_grad()
+        pred_missing, pred_feat, nc_pred = self.local_gen(data)
+        pred_missing, pred_feat, nc_pred = pred_missing[data.train_mask], pred_feat[data.train_mask], nc_pred[data.train_mask]
+        loss_num = self.criterion_num(pred_missing, data.num_missing[data.train_mask])
+        loss_feat = self.criterion_feat(
+            pred_feats=pred_feat,
+            true_feats=data.x_missing[data.train_mask],
+            pred_missing=pred_missing,
+            true_missing=data.num_missing[data.train_mask],
+            num_pred=self.num_pred
+        ).requires_grad_()
+        loss_clf = F.cross_entropy(nc_pred, data.y[data.train_mask])
+        loss = (self.a * loss_num + self.b * loss_feat + self.c * loss_clf).float() / client_num
+        loss.backward()
+        self.optimizer.step()
+    
+    def embedding(self):
+        data = self.hide_data.to(self.device)
+        return self.fed_gen.encoder_model(data.x, data.edge_index).to('cpu')
+    
+    def update_by_grad(self, grads):
+        """
+        Arguments:
+            grads: grads of other clients to optimize the local model
+        :returns:
+            state_dict of generation model
+        """
+        for key in grads.keys():
+            if isinstance(grads[key], list):
+                grads[key] = torch.FloatTensor(grads[key]).to(self.device)
+            elif isinstance(grads[key], torch.Tensor):
+                grads[key] = grads[key].to(self.device)
+        
+        for key, value in self.fed_gen.named_parameters():
+            value.grad += grads[key]
+        
+        self.optimizer.step()
+        return self.fed_gen.state_dict()
+    
+    def cal_grad(self, model_para, embedding, true_missing, client_num):
+        """
+        Arguments:
+            model_para: model parameters
+            embedding: output embeddings after local encoder
+            true_missing: number of missing node
+        :returns:
+            grads: grads to optimize the model of other clients
+        """
+        para_backup = copy.deepcopy(self.fed_gen.state_dict())
+        
+        for key in model_para.keys():
+            if isinstance(model_para[key], list):
+                model_para[key] = torch.FloatTensor(model_para[key])
+        self.fed_gen.load_state_dict(model_para)
+        self.fed_gen.train()
+
+        raw_data = self.data.to(self.device)
+        embedding = torch.FloatTensor(embedding).to(self.device)
+        true_missing = true_missing.long().to(self.device)
+        pred_missing = self.fed_gen.reg_model(embedding)
+        pred_feat = self.fed_gen.gen(embedding)
+
+        # Random pick node and compare its neighbors with predicted nodes
+        choice = np.random.choice(raw_data.num_nodes, embedding.shape[0])
+        global_target_feat = []
+        for c_i in choice:
+            neighbors_ids = raw_data.edge_index[1][torch.where(
+                raw_data.edge_index[0] == c_i)[0]]
+            while len(neighbors_ids) == 0:
+                id_i = np.random.choice(raw_data.num_nodes, 1)[0]
+                neighbors_ids = raw_data.edge_index[1][torch.where(
+                    raw_data.edge_index[0] == id_i)[0]]
+            choice_i = np.random.choice(neighbors_ids.detach().cpu().numpy(),
+                                        self.num_pred)
+            for ch_i in choice_i:
+                global_target_feat.append(
+                    raw_data.x[ch_i].detach().cpu().numpy())
+        global_target_feat = np.asarray(global_target_feat).reshape(
+            (embedding.shape[0], self.num_pred,
+             raw_data.num_node_features))
+        loss_feat = self.criterion_feat(pred_feats=pred_feat,
+                                        true_feats=global_target_feat,
+                                        pred_missing=pred_missing,
+                                        true_missing=true_missing,
+                                        num_pred=self.num_pred)
+        loss = self.b * loss_feat
+        loss = (1.0 / client_num * loss).requires_grad_()
+        loss.backward()
+        grads = {
+            key: value.grad
+            for key, value in self.fed_gen.named_parameters()
+        }
+        # Rollback
+        self.fed_gen.load_state_dict(para_backup)
+        return grads
+
+    def setup_fedsage(self):
+        self.filled_data = GraphMender(
+            model=self.fed_gen,
+            impaired_data = self.hide_data.cpu(),
+            original_data = self.data,
+            num_pred = self.num_pred
+        )
+        self.data = self.filled_data
+        self.optimizer = torch.optim.Adam([
+            {'params': self.gnnLayer.parameters()},
+            {'params': self.classification.parameters()}
+        ], lr=self.lr)
